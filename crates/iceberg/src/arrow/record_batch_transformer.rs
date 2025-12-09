@@ -19,9 +19,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{
-    Array as ArrowArray, ArrayRef, BinaryArray, BooleanArray, Date32Array, Float32Array,
-    Float64Array, Int32Array, Int64Array, NullArray, RecordBatch, RecordBatchOptions, StringArray,
-    StructArray,
+    new_null_array, Array as ArrowArray, ArrayRef, BinaryArray, BooleanArray, Date32Array,
+    Float32Array, Float64Array, Int32Array, Int64Array, NullArray, RecordBatch,
+    RecordBatchOptions, StringArray, StructArray,
 };
 use arrow_buffer::NullBuffer;
 use arrow_cast::cast;
@@ -798,10 +798,14 @@ impl RecordBatchTransformer {
                 ))
             }
             (DataType::Null, _) => Arc::new(NullArray::new(num_rows)),
-            (dt, _) => {
+            // For any type without a default value, create a null array
+            // This handles complex types like List, Map, LargeList, FixedSizeList, etc.
+            (_, None) => new_null_array(target_type, num_rows),
+            // Error only when we have a value but don't know how to create that type
+            (dt, Some(_)) => {
                 return Err(Error::new(
                     ErrorKind::Unexpected,
-                    format!("unexpected target column type {}", dt),
+                    format!("cannot create column with default value for type {}", dt),
                 ));
             }
         })
@@ -2082,5 +2086,102 @@ mod test {
             .unwrap();
         assert_eq!(c_column.value(0), 999);
         assert_eq!(c_column.value(1), 999);
+    }
+
+    #[test]
+    fn test_struct_with_missing_list_field_returns_null() {
+        use arrow_array::{ListArray, StructArray};
+
+        // Iceberg schema: struct with id and list field
+        let snapshot_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(
+                        2,
+                        "test_struct",
+                        Type::Struct(crate::spec::StructType::new(vec![
+                            NestedField::optional(101, "a", Type::Primitive(PrimitiveType::Int))
+                                .into(),
+                            NestedField::optional(
+                                102,
+                                "items",
+                                Type::List(crate::spec::ListType::new(Arc::new(
+                                    NestedField::optional(
+                                        1021,
+                                        "element",
+                                        Type::Primitive(PrimitiveType::Int),
+                                    ),
+                                ))),
+                            )
+                            .into(),
+                        ])),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let projected_field_ids = [1, 2];
+
+        let mut transformer =
+            RecordBatchTransformerBuilder::new(snapshot_schema, &projected_field_ids).build();
+
+        // Parquet file has struct with only field 'a' (missing 'items' list)
+        let struct_fields = vec![simple_field("a", DataType::Int32, true, "101")];
+        let struct_data_type = DataType::Struct(struct_fields.clone().into());
+
+        let parquet_schema = Arc::new(ArrowSchema::new(vec![
+            simple_field("id", DataType::Int32, false, "1"),
+            Field::new("test_struct", struct_data_type.clone(), true).with_metadata(
+                HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "2".to_string())]),
+            ),
+        ]));
+
+        let struct_array = StructArray::new(
+            struct_fields.into(),
+            vec![Arc::new(Int32Array::from(vec![Some(10), Some(20), Some(30)]))],
+            None,
+        );
+
+        let parquet_batch = RecordBatch::try_new(parquet_schema, vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(struct_array),
+        ])
+        .unwrap();
+
+        let result = transformer.process_record_batch(parquet_batch).unwrap();
+
+        assert_eq!(result.num_columns(), 2);
+        assert_eq!(result.num_rows(), 3);
+
+        let struct_column = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(struct_column.num_columns(), 2); // Should have a and items
+
+        // Field a: should have values
+        let a_column = struct_column
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(a_column.value(0), 10);
+        assert_eq!(a_column.value(1), 20);
+        assert_eq!(a_column.value(2), 30);
+
+        // Field items (List): should be all nulls
+        let items_column = struct_column
+            .column(1)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        assert!(items_column.is_null(0));
+        assert!(items_column.is_null(1));
+        assert!(items_column.is_null(2));
     }
 }
