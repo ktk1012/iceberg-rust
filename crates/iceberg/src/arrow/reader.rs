@@ -23,7 +23,11 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use arrow_arith::boolean::{and, and_kleene, is_not_null, is_null, not, or, or_kleene};
-use arrow_array::{Array, ArrayRef, BooleanArray, Datum as ArrowDatum, RecordBatch, Scalar};
+use arrow_array::{
+    Array, ArrayRef, BooleanArray, Datum as ArrowDatum, RecordBatch, Scalar, StructArray,
+    make_array,
+};
+use arrow_buffer::NullBuffer;
 use arrow_cast::cast::cast;
 use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
 use arrow_schema::{
@@ -1166,11 +1170,18 @@ struct PredicateConverter<'a> {
 }
 
 impl PredicateConverter<'_> {
-    /// When visiting a bound reference, we return index of the leaf column in the
-    /// required column indices which is used to project the column in the record batch.
+    /// When visiting a bound reference, we return the index path to the leaf column
+    /// in the projected record batch. The index path is used to project the column
+    /// including nested fields within struct columns.
+    ///
     /// Return None if the field id is not found in the column map, which is possible
     /// due to schema evolution.
-    fn bound_reference(&mut self, reference: &BoundReference) -> Result<Option<usize>> {
+    ///
+    /// The returned index path has the format:
+    /// - For top-level columns: `[column_index]`
+    /// - For nested fields: `[nested_field_index, ..., root_column_index]`
+    ///   (deepest field first, root column last)
+    fn bound_reference(&mut self, reference: &BoundReference) -> Result<Option<Vec<usize>>> {
         // The leaf column's index in Parquet schema.
         if let Some(column_idx) = self.column_map.get(&reference.field().id) {
             if self.parquet_schema.get_column_root(*column_idx).is_group() {
@@ -1196,7 +1207,9 @@ impl PredicateConverter<'_> {
             ),
                 ))?;
 
-            Ok(Some(index))
+            // Return as a single-element path for top-level columns
+            // For nested fields, this would be extended with parent indices
+            Ok(Some(vec![index]))
         } else {
             Ok(None)
         }
@@ -1217,19 +1230,77 @@ impl PredicateConverter<'_> {
     }
 }
 
-/// Gets the leaf column from the record batch for the required column index. Only
-/// supports top-level columns for now.
+/// Gets a column from the record batch using a field index path.
+///
+/// The `field_index_path` is a vector of indices where:
+/// - The last element is the root column index in the RecordBatch
+/// - Earlier elements navigate into nested structs (deepest field first)
+///
+/// For example:
+/// - `[0]` means the first column at the root level
+/// - `[1, 0]` means the second field of the first root column (assuming root column 0 is a struct)
+///
+/// This function handles null propagation correctly by unioning null buffers
+/// from parent structs down to the leaf field.
 fn project_column(
     batch: &RecordBatch,
-    column_idx: usize,
+    field_index_path: &[usize],
 ) -> std::result::Result<ArrayRef, ArrowError> {
-    let column = batch.column(column_idx);
+    if field_index_path.is_empty() {
+        return Err(ArrowError::SchemaError(
+            "Field index path cannot be empty".to_string(),
+        ));
+    }
 
-    match column.data_type() {
-        DataType::Struct(_) => Err(ArrowError::SchemaError(
-            "Does not support struct column yet.".to_string(),
-        )),
-        _ => Ok(column.clone()),
+    let mut rev_iterator = field_index_path.iter().rev();
+    let root_idx = *rev_iterator.next().unwrap();
+
+    if root_idx >= batch.num_columns() {
+        return Err(ArrowError::SchemaError(format!(
+            "Column index {} out of bounds for batch with {} columns",
+            root_idx,
+            batch.num_columns()
+        )));
+    }
+
+    let mut array = batch.column(root_idx).clone();
+    let mut null_buffer = array.logical_nulls();
+
+    // Navigate into nested structs if the path has more than one element
+    for idx in rev_iterator {
+        let struct_array = array.as_any().downcast_ref::<StructArray>().ok_or_else(|| {
+            ArrowError::SchemaError(format!(
+                "Expected struct array at path index {}, but got {:?}",
+                idx,
+                array.data_type()
+            ))
+        })?;
+
+        if *idx >= struct_array.num_columns() {
+            return Err(ArrowError::SchemaError(format!(
+                "Nested field index {} out of bounds for struct with {} fields",
+                idx,
+                struct_array.num_columns()
+            )));
+        }
+
+        array = struct_array.column(*idx).clone();
+        // Union null buffers to propagate parent nulls to children
+        null_buffer = NullBuffer::union(null_buffer.as_ref(), array.logical_nulls().as_ref());
+    }
+
+    // Apply the accumulated null buffer to the final array
+    if null_buffer.is_some() {
+        Ok(make_array(
+            array
+                .to_data()
+                .into_builder()
+                .nulls(null_buffer)
+                .build()
+                .map_err(|e| ArrowError::InvalidArgumentError(e.to_string()))?,
+        ))
+    } else {
+        Ok(array)
     }
 }
 
@@ -1283,9 +1354,9 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
         reference: &BoundReference,
         _predicate: &BoundPredicate,
     ) -> Result<Box<PredicateResult>> {
-        if let Some(idx) = self.bound_reference(reference)? {
+        if let Some(field_index_path) = self.bound_reference(reference)? {
             Ok(Box::new(move |batch| {
-                let column = project_column(&batch, idx)?;
+                let column = project_column(&batch, &field_index_path)?;
                 is_null(&column)
             }))
         } else {
@@ -1299,9 +1370,9 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
         reference: &BoundReference,
         _predicate: &BoundPredicate,
     ) -> Result<Box<PredicateResult>> {
-        if let Some(idx) = self.bound_reference(reference)? {
+        if let Some(field_index_path) = self.bound_reference(reference)? {
             Ok(Box::new(move |batch| {
-                let column = project_column(&batch, idx)?;
+                let column = project_column(&batch, &field_index_path)?;
                 is_not_null(&column)
             }))
         } else {
@@ -1342,11 +1413,11 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
         literal: &Datum,
         _predicate: &BoundPredicate,
     ) -> Result<Box<PredicateResult>> {
-        if let Some(idx) = self.bound_reference(reference)? {
+        if let Some(field_index_path) = self.bound_reference(reference)? {
             let literal = get_arrow_datum(literal)?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
+                let left = project_column(&batch, &field_index_path)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 lt(&left, literal.as_ref())
             }))
@@ -1362,11 +1433,11 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
         literal: &Datum,
         _predicate: &BoundPredicate,
     ) -> Result<Box<PredicateResult>> {
-        if let Some(idx) = self.bound_reference(reference)? {
+        if let Some(field_index_path) = self.bound_reference(reference)? {
             let literal = get_arrow_datum(literal)?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
+                let left = project_column(&batch, &field_index_path)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 lt_eq(&left, literal.as_ref())
             }))
@@ -1382,11 +1453,11 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
         literal: &Datum,
         _predicate: &BoundPredicate,
     ) -> Result<Box<PredicateResult>> {
-        if let Some(idx) = self.bound_reference(reference)? {
+        if let Some(field_index_path) = self.bound_reference(reference)? {
             let literal = get_arrow_datum(literal)?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
+                let left = project_column(&batch, &field_index_path)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 gt(&left, literal.as_ref())
             }))
@@ -1402,11 +1473,11 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
         literal: &Datum,
         _predicate: &BoundPredicate,
     ) -> Result<Box<PredicateResult>> {
-        if let Some(idx) = self.bound_reference(reference)? {
+        if let Some(field_index_path) = self.bound_reference(reference)? {
             let literal = get_arrow_datum(literal)?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
+                let left = project_column(&batch, &field_index_path)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 gt_eq(&left, literal.as_ref())
             }))
@@ -1422,11 +1493,11 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
         literal: &Datum,
         _predicate: &BoundPredicate,
     ) -> Result<Box<PredicateResult>> {
-        if let Some(idx) = self.bound_reference(reference)? {
+        if let Some(field_index_path) = self.bound_reference(reference)? {
             let literal = get_arrow_datum(literal)?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
+                let left = project_column(&batch, &field_index_path)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 eq(&left, literal.as_ref())
             }))
@@ -1442,11 +1513,11 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
         literal: &Datum,
         _predicate: &BoundPredicate,
     ) -> Result<Box<PredicateResult>> {
-        if let Some(idx) = self.bound_reference(reference)? {
+        if let Some(field_index_path) = self.bound_reference(reference)? {
             let literal = get_arrow_datum(literal)?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
+                let left = project_column(&batch, &field_index_path)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 neq(&left, literal.as_ref())
             }))
@@ -1462,11 +1533,11 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
         literal: &Datum,
         _predicate: &BoundPredicate,
     ) -> Result<Box<PredicateResult>> {
-        if let Some(idx) = self.bound_reference(reference)? {
+        if let Some(field_index_path) = self.bound_reference(reference)? {
             let literal = get_arrow_datum(literal)?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
+                let left = project_column(&batch, &field_index_path)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 starts_with(&left, literal.as_ref())
             }))
@@ -1482,11 +1553,11 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
         literal: &Datum,
         _predicate: &BoundPredicate,
     ) -> Result<Box<PredicateResult>> {
-        if let Some(idx) = self.bound_reference(reference)? {
+        if let Some(field_index_path) = self.bound_reference(reference)? {
             let literal = get_arrow_datum(literal)?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
+                let left = project_column(&batch, &field_index_path)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 // update here if arrow ever adds a native not_starts_with
                 not(&starts_with(&left, literal.as_ref())?)
@@ -1503,7 +1574,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
         literals: &FnvHashSet<Datum>,
         _predicate: &BoundPredicate,
     ) -> Result<Box<PredicateResult>> {
-        if let Some(idx) = self.bound_reference(reference)? {
+        if let Some(field_index_path) = self.bound_reference(reference)? {
             let literals: Vec<_> = literals
                 .iter()
                 .map(|lit| get_arrow_datum(lit).unwrap())
@@ -1511,7 +1582,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
 
             Ok(Box::new(move |batch| {
                 // update this if arrow ever adds a native is_in kernel
-                let left = project_column(&batch, idx)?;
+                let left = project_column(&batch, &field_index_path)?;
 
                 let mut acc = BooleanArray::from(vec![false; batch.num_rows()]);
                 for literal in &literals {
@@ -1533,7 +1604,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
         literals: &FnvHashSet<Datum>,
         _predicate: &BoundPredicate,
     ) -> Result<Box<PredicateResult>> {
-        if let Some(idx) = self.bound_reference(reference)? {
+        if let Some(field_index_path) = self.bound_reference(reference)? {
             let literals: Vec<_> = literals
                 .iter()
                 .map(|lit| get_arrow_datum(lit).unwrap())
@@ -1541,7 +1612,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
 
             Ok(Box::new(move |batch| {
                 // update this if arrow ever adds a native not_in kernel
-                let left = project_column(&batch, idx)?;
+                let left = project_column(&batch, &field_index_path)?;
                 let mut acc = BooleanArray::from(vec![true; batch.num_rows()]);
                 for literal in &literals {
                     let literal = try_cast_literal(literal, left.data_type())?;
@@ -1681,7 +1752,7 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::ErrorKind;
-    use crate::arrow::reader::{CollectFieldIdVisitor, PARQUET_FIELD_ID_META_KEY};
+    use crate::arrow::reader::{CollectFieldIdVisitor, PARQUET_FIELD_ID_META_KEY, project_column};
     use crate::arrow::{ArrowReader, ArrowReaderBuilder};
     use crate::delete_vector::DeleteVector;
     use crate::expr::visitors::bound_predicate_visitor::visit;
@@ -3950,5 +4021,154 @@ message schema {
         assert_eq!(name_col.value(1), "Bob");
         assert_eq!(name_col.value(2), "Charlie");
         assert_eq!(name_col.value(3), "Dave");
+    }
+
+    /// Test the project_column function with nested struct fields
+    #[test]
+    fn test_project_column_nested_struct() {
+        use arrow_array::{Int32Array, StructArray};
+        use arrow_schema::Fields;
+
+        // Create a schema with nested struct: id, person { name, age }
+        let inner_fields = vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("age", DataType::Int32, false),
+        ];
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "person",
+                DataType::Struct(Fields::from(inner_fields.clone())),
+                false,
+            ),
+        ]));
+
+        // Create test data
+        let id_data = Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef;
+        let name_data = Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])) as ArrayRef;
+        let age_data = Arc::new(Int32Array::from(vec![30, 25, 35])) as ArrayRef;
+        let person_data = Arc::new(StructArray::from(vec![
+            (
+                Arc::new(Field::new("name", DataType::Utf8, false)),
+                name_data,
+            ),
+            (
+                Arc::new(Field::new("age", DataType::Int32, false)),
+                age_data,
+            ),
+        ])) as ArrayRef;
+
+        let batch =
+            RecordBatch::try_new(arrow_schema.clone(), vec![id_data, person_data]).unwrap();
+
+        // Test 1: Access root-level column (id) with single-element path [0]
+        let id_col = project_column(&batch, &[0]).unwrap();
+        let id_array = id_col.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(id_array.value(0), 1);
+        assert_eq!(id_array.value(1), 2);
+        assert_eq!(id_array.value(2), 3);
+
+        // Test 2: Access nested field (person.name) with path [0, 1]
+        // Path meaning: index 1 is the root column (person struct), index 0 is the first field (name)
+        let name_col = project_column(&batch, &[0, 1]).unwrap();
+        let name_array = name_col.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(name_array.value(0), "Alice");
+        assert_eq!(name_array.value(1), "Bob");
+        assert_eq!(name_array.value(2), "Charlie");
+
+        // Test 3: Access nested field (person.age) with path [1, 1]
+        // Path meaning: index 1 is the root column (person struct), index 1 is the second field (age)
+        let age_col = project_column(&batch, &[1, 1]).unwrap();
+        let age_array = age_col.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(age_array.value(0), 30);
+        assert_eq!(age_array.value(1), 25);
+        assert_eq!(age_array.value(2), 35);
+    }
+
+    /// Test the project_column function with null propagation from parent struct
+    #[test]
+    fn test_project_column_null_propagation() {
+        use arrow_array::{Array, Int32Array, StructArray};
+        use arrow_buffer::NullBuffer;
+        use arrow_schema::Fields;
+
+        // Create a schema with nested struct: id, person { name, age }
+        let inner_fields = vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("age", DataType::Int32, true),
+        ];
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new(
+                "person",
+                DataType::Struct(Fields::from(inner_fields.clone())),
+                true, // nullable struct
+            ),
+        ]));
+
+        // Create test data with a null in the parent struct
+        let id_data = Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef;
+        let name_data = Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])) as ArrayRef;
+        let age_data = Arc::new(Int32Array::from(vec![30, 25, 35])) as ArrayRef;
+
+        // Create struct with second row null
+        let struct_null_buffer = NullBuffer::from(vec![true, false, true]); // row 1 is null
+        let person_data = Arc::new(
+            StructArray::try_new(
+                Fields::from(inner_fields.clone()),
+                vec![name_data, age_data],
+                Some(struct_null_buffer),
+            )
+            .unwrap(),
+        ) as ArrayRef;
+
+        let batch =
+            RecordBatch::try_new(arrow_schema.clone(), vec![id_data, person_data]).unwrap();
+
+        // Access nested field (person.name) - should inherit null from parent
+        let name_col = project_column(&batch, &[0, 1]).unwrap();
+        let name_array = name_col.as_any().downcast_ref::<StringArray>().unwrap();
+
+        // The second row should be null because the parent struct is null
+        assert!(name_array.is_valid(0));
+        assert!(!name_array.is_valid(1)); // Should be null due to parent null
+        assert!(name_array.is_valid(2));
+
+        assert_eq!(name_array.value(0), "Alice");
+        assert_eq!(name_array.value(2), "Charlie");
+    }
+
+    /// Test project_column with empty path returns error
+    #[test]
+    fn test_project_column_empty_path() {
+        use arrow_array::Int32Array;
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let id_data = Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef;
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![id_data]).unwrap();
+
+        let result = project_column(&batch, &[]);
+        assert!(result.is_err());
+    }
+
+    /// Test project_column with out of bounds index returns error
+    #[test]
+    fn test_project_column_out_of_bounds() {
+        use arrow_array::Int32Array;
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![Field::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let id_data = Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef;
+        let batch = RecordBatch::try_new(arrow_schema.clone(), vec![id_data]).unwrap();
+
+        let result = project_column(&batch, &[5]); // Only 1 column exists
+        assert!(result.is_err());
     }
 }

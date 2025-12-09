@@ -100,6 +100,19 @@ pub(crate) enum ColumnSource {
         target_type: DataType,
         value: Option<PrimitiveLiteral>,
     },
+
+    // Signifies that a struct column needs to be reconstructed with
+    // a different set of fields. This handles schema evolution where
+    // nested fields are added to or removed from a struct.
+    // The source struct is read from source_index, and each child field
+    // is transformed according to the nested_operations.
+    TransformStruct {
+        source_index: usize,
+        target_fields: arrow_schema::Fields,
+        /// Operations for each field in target_fields.
+        /// Each operation describes how to source that nested field.
+        nested_operations: Vec<ColumnSource>,
+    },
     // The iceberg spec refers to other permissible schema evolution actions
     // (see https://iceberg.apache.org/spec/#schema-evolution):
     // renaming fields, deleting fields and reordering fields.
@@ -441,6 +454,17 @@ impl RecordBatchTransformer {
                             ColumnSource::PassThrough {
                                 source_index: *source_index,
                             }
+                        } else if let (DataType::Struct(source_fields), DataType::Struct(target_fields)) =
+                            (source_field.data_type(), target_type)
+                        {
+                            // Handle struct schema evolution: source and target are both structs
+                            // but may have different nested fields
+                            Self::generate_struct_transform_operation(
+                                source_fields,
+                                target_fields,
+                                *source_index,
+                                snapshot_schema,
+                            )
                         } else {
                             ColumnSource::Promote {
                                 target_type: target_type.clone(),
@@ -480,6 +504,95 @@ impl RecordBatchTransformer {
                 Ok(column_source)
             })
             .collect()
+    }
+
+    /// Generate a TransformStruct operation for struct schema evolution.
+    /// Compares source and target struct fields to create nested operations.
+    fn generate_struct_transform_operation(
+        source_fields: &arrow_schema::Fields,
+        target_fields: &arrow_schema::Fields,
+        source_index: usize,
+        snapshot_schema: &IcebergSchema,
+    ) -> ColumnSource {
+        // Build a map of field_id -> (source_field, source_index) for source struct
+        let source_field_map: HashMap<i32, (&arrow_schema::FieldRef, usize)> = source_fields
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, field)| {
+                field
+                    .metadata()
+                    .get(PARQUET_FIELD_ID_META_KEY)
+                    .and_then(|id_str| id_str.parse::<i32>().ok())
+                    .map(|field_id| (field_id, (field, idx)))
+            })
+            .collect();
+
+        // Generate operations for each target field
+        let nested_operations: Vec<ColumnSource> = target_fields
+            .iter()
+            .map(|target_field| {
+                let target_field_id = target_field
+                    .metadata()
+                    .get(PARQUET_FIELD_ID_META_KEY)
+                    .and_then(|id_str| id_str.parse::<i32>().ok());
+
+                match target_field_id {
+                    Some(field_id) if source_field_map.contains_key(&field_id) => {
+                        let (source_field, source_idx) = source_field_map[&field_id];
+
+                        if source_field.data_type().equals_datatype(target_field.data_type()) {
+                            // Same type - pass through
+                            ColumnSource::PassThrough {
+                                source_index: source_idx,
+                            }
+                        } else if let (
+                            DataType::Struct(nested_source_fields),
+                            DataType::Struct(nested_target_fields),
+                        ) = (source_field.data_type(), target_field.data_type())
+                        {
+                            // Recursively handle nested struct evolution
+                            Self::generate_struct_transform_operation(
+                                nested_source_fields,
+                                nested_target_fields,
+                                source_idx,
+                                snapshot_schema,
+                            )
+                        } else {
+                            // Type promotion needed
+                            ColumnSource::Promote {
+                                target_type: target_field.data_type().clone(),
+                                source_index: source_idx,
+                            }
+                        }
+                    }
+                    _ => {
+                        // Field not found in source - add NULL (per Iceberg spec rule #4)
+                        // Check for initial_default if field_id is available
+                        let default_value = target_field_id
+                            .and_then(|fid| snapshot_schema.field_by_id(fid))
+                            .and_then(|iceberg_field| iceberg_field.initial_default.as_ref())
+                            .and_then(|lit| {
+                                if let Literal::Primitive(prim) = lit {
+                                    Some(prim.clone())
+                                } else {
+                                    None
+                                }
+                            });
+
+                        ColumnSource::Add {
+                            target_type: target_field.data_type().clone(),
+                            value: default_value,
+                        }
+                    }
+                }
+            })
+            .collect();
+
+        ColumnSource::TransformStruct {
+            source_index,
+            target_fields: target_fields.clone(),
+            nested_operations,
+        }
     }
 
     fn build_field_id_to_arrow_schema_map(
@@ -529,9 +642,82 @@ impl RecordBatchTransformer {
                     ColumnSource::Add { target_type, value } => {
                         Self::create_column(target_type, value, num_rows)?
                     }
+
+                    ColumnSource::TransformStruct {
+                        source_index,
+                        target_fields,
+                        nested_operations,
+                    } => {
+                        Self::transform_struct_column(
+                            &columns[*source_index],
+                            target_fields,
+                            nested_operations,
+                        )?
+                    }
                 })
             })
             .collect()
+    }
+
+    /// Transform a struct column by reconstructing it with potentially different nested fields.
+    /// This handles schema evolution where nested fields are added to or removed from a struct.
+    fn transform_struct_column(
+        source_column: &Arc<dyn ArrowArray>,
+        target_fields: &arrow_schema::Fields,
+        nested_operations: &[ColumnSource],
+    ) -> Result<ArrayRef> {
+        let source_struct = source_column
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    "Expected struct array for TransformStruct operation",
+                )
+            })?;
+
+        let num_rows = source_struct.len();
+        let source_columns: Vec<Arc<dyn ArrowArray>> =
+            (0..source_struct.num_columns())
+                .map(|i| source_struct.column(i).clone())
+                .collect();
+
+        // Transform each nested field according to its operation
+        let transformed_columns: Vec<ArrayRef> = nested_operations
+            .iter()
+            .map(|op| {
+                Ok(match op {
+                    ColumnSource::PassThrough { source_index } => {
+                        source_columns[*source_index].clone()
+                    }
+                    ColumnSource::Promote {
+                        target_type,
+                        source_index,
+                    } => cast(&*source_columns[*source_index], target_type)?,
+                    ColumnSource::Add { target_type, value } => {
+                        Self::create_column(target_type, value, num_rows)?
+                    }
+                    ColumnSource::TransformStruct {
+                        source_index,
+                        target_fields: nested_target_fields,
+                        nested_operations: deeply_nested_ops,
+                    } => Self::transform_struct_column(
+                        &source_columns[*source_index],
+                        nested_target_fields,
+                        deeply_nested_ops,
+                    )?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // Preserve the original struct's null bitmap
+        let null_buffer = source_struct.nulls().cloned();
+
+        Ok(Arc::new(StructArray::new(
+            target_fields.clone(),
+            transformed_columns,
+            null_buffer,
+        )))
     }
 
     fn create_column(
@@ -1535,5 +1721,366 @@ mod test {
             .unwrap();
         assert!(notes_column.is_null(0));
         assert!(notes_column.is_null(1));
+    }
+
+    /// Test that when a struct exists in Parquet but has fewer nested fields than the Iceberg schema,
+    /// the missing nested fields are filled with NULL values per Iceberg spec rule #4.
+    ///
+    /// This reproduces the scenario where:
+    /// 1. Parquet file was written with: test_struct { a: Int, b: Int }
+    /// 2. Iceberg schema evolved to add: test_struct { a: Int, b: Int, c: Int }
+    /// 3. Reading old file should return: { a: value, b: value, c: NULL }
+    #[test]
+    fn test_struct_with_missing_nested_field_returns_null() {
+        use arrow_array::StructArray;
+
+        // Iceberg schema has struct with 3 fields: a, b, c
+        let snapshot_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(
+                        2,
+                        "test_struct",
+                        Type::Struct(crate::spec::StructType::new(vec![
+                            NestedField::optional(101, "a", Type::Primitive(PrimitiveType::Int))
+                                .into(),
+                            NestedField::optional(102, "b", Type::Primitive(PrimitiveType::Int))
+                                .into(),
+                            NestedField::optional(103, "c", Type::Primitive(PrimitiveType::Int))
+                                .into(),
+                        ])),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let projected_field_ids = [1, 2]; // id, test_struct
+
+        let mut transformer =
+            RecordBatchTransformerBuilder::new(snapshot_schema, &projected_field_ids).build();
+
+        // Parquet file has struct with only 2 fields: a, b (missing c)
+        let struct_fields = vec![
+            simple_field("a", DataType::Int32, true, "101"),
+            simple_field("b", DataType::Int32, true, "102"),
+            // Note: field "c" (field_id=103) is missing from Parquet
+        ];
+        let struct_data_type = DataType::Struct(struct_fields.clone().into());
+
+        let parquet_schema = Arc::new(ArrowSchema::new(vec![
+            simple_field("id", DataType::Int32, false, "1"),
+            Field::new("test_struct", struct_data_type.clone(), true).with_metadata(
+                HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "2".to_string())]),
+            ),
+        ]));
+
+        // Create struct array with values for a and b only
+        let struct_array = StructArray::new(
+            struct_fields.into(),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(10), Some(20), Some(30)])),
+                Arc::new(Int32Array::from(vec![Some(100), Some(200), Some(300)])),
+            ],
+            None,
+        );
+
+        let parquet_batch = RecordBatch::try_new(parquet_schema, vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(struct_array),
+        ])
+        .unwrap();
+
+        let result = transformer.process_record_batch(parquet_batch).unwrap();
+
+        assert_eq!(result.num_columns(), 2);
+        assert_eq!(result.num_rows(), 3);
+
+        // Verify id column
+        let id_column = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(id_column.values(), &[1, 2, 3]);
+
+        // Verify struct column
+        let struct_column = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(struct_column.num_columns(), 3); // Should have a, b, c
+
+        // Field a: should have values from Parquet
+        let a_column = struct_column
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(a_column.value(0), 10);
+        assert_eq!(a_column.value(1), 20);
+        assert_eq!(a_column.value(2), 30);
+
+        // Field b: should have values from Parquet
+        let b_column = struct_column
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(b_column.value(0), 100);
+        assert_eq!(b_column.value(1), 200);
+        assert_eq!(b_column.value(2), 300);
+
+        // Field c: should be NULL (missing from Parquet, per Iceberg spec rule #4)
+        let c_column = struct_column
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert!(c_column.is_null(0));
+        assert!(c_column.is_null(1));
+        assert!(c_column.is_null(2));
+    }
+
+    /// Test deeply nested struct with missing field at inner level.
+    ///
+    /// This verifies that the recursive TransformStruct logic correctly handles
+    /// schema evolution in deeply nested structures (3+ levels deep).
+    ///
+    /// Scenario:
+    /// - Iceberg schema: outer { middle { inner { a: Int, b: Int } } }
+    /// - Parquet file: outer { middle { inner { a: Int } } }  (missing b)
+    /// - Result: outer { middle { inner { a: value, b: NULL } } }
+    #[test]
+    fn test_deeply_nested_struct_with_missing_field() {
+        use arrow_array::StructArray;
+
+        // Iceberg schema has 3 levels of nesting with inner having fields a and b
+        let snapshot_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(
+                        2,
+                        "outer",
+                        Type::Struct(crate::spec::StructType::new(vec![NestedField::optional(
+                            3,
+                            "middle",
+                            Type::Struct(crate::spec::StructType::new(vec![NestedField::optional(
+                                4,
+                                "inner",
+                                Type::Struct(crate::spec::StructType::new(vec![
+                                    NestedField::optional(
+                                        101,
+                                        "a",
+                                        Type::Primitive(PrimitiveType::Int),
+                                    )
+                                    .into(),
+                                    NestedField::optional(
+                                        102,
+                                        "b",
+                                        Type::Primitive(PrimitiveType::Int),
+                                    )
+                                    .into(),
+                                ])),
+                            )
+                            .into()])),
+                        )
+                        .into()])),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let projected_field_ids = [1, 2]; // id, outer
+
+        let mut transformer =
+            RecordBatchTransformerBuilder::new(snapshot_schema, &projected_field_ids).build();
+
+        // Build Parquet schema with inner having only field a (missing b)
+        let inner_fields = vec![simple_field("a", DataType::Int32, true, "101")];
+        let inner_type = DataType::Struct(inner_fields.clone().into());
+
+        let middle_fields = vec![Field::new("inner", inner_type.clone(), true).with_metadata(
+            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "4".to_string())]),
+        )];
+        let middle_type = DataType::Struct(middle_fields.clone().into());
+
+        let outer_fields = vec![Field::new("middle", middle_type.clone(), true).with_metadata(
+            HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "3".to_string())]),
+        )];
+        let outer_type = DataType::Struct(outer_fields.clone().into());
+
+        let parquet_schema = Arc::new(ArrowSchema::new(vec![
+            simple_field("id", DataType::Int32, false, "1"),
+            Field::new("outer", outer_type, true).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "2".to_string(),
+            )])),
+        ]));
+
+        // Build nested struct arrays
+        let inner_array = StructArray::new(
+            inner_fields.into(),
+            vec![Arc::new(Int32Array::from(vec![Some(42), Some(99)]))],
+            None,
+        );
+
+        let middle_array = StructArray::new(
+            middle_fields.into(),
+            vec![Arc::new(inner_array)],
+            None,
+        );
+
+        let outer_array = StructArray::new(
+            outer_fields.into(),
+            vec![Arc::new(middle_array)],
+            None,
+        );
+
+        let parquet_batch = RecordBatch::try_new(parquet_schema, vec![
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(outer_array),
+        ])
+        .unwrap();
+
+        let result = transformer.process_record_batch(parquet_batch).unwrap();
+
+        assert_eq!(result.num_columns(), 2);
+        assert_eq!(result.num_rows(), 2);
+
+        // Navigate to the inner struct
+        let outer_column = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(outer_column.num_columns(), 1);
+
+        let middle_column = outer_column
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(middle_column.num_columns(), 1);
+
+        let inner_column = middle_column
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(inner_column.num_columns(), 2); // Should have both a and b
+
+        // Field a: should have values from Parquet
+        let a_column = inner_column
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(a_column.value(0), 42);
+        assert_eq!(a_column.value(1), 99);
+
+        // Field b: should be NULL (missing from Parquet at deeply nested level)
+        let b_column = inner_column
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert!(b_column.is_null(0));
+        assert!(b_column.is_null(1));
+    }
+
+    /// Test struct schema evolution with initial_default for missing nested field.
+    ///
+    /// Verifies that when a nested field has initial_default defined, the transformer
+    /// uses that default value instead of NULL (per Iceberg spec rule #3).
+    #[test]
+    fn test_struct_missing_nested_field_uses_initial_default() {
+        use arrow_array::StructArray;
+
+        // Iceberg schema has struct with field c having initial_default
+        let snapshot_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                    NestedField::optional(
+                        2,
+                        "test_struct",
+                        Type::Struct(crate::spec::StructType::new(vec![
+                            NestedField::optional(101, "a", Type::Primitive(PrimitiveType::Int))
+                                .into(),
+                            NestedField::optional(102, "c", Type::Primitive(PrimitiveType::Int))
+                                .with_initial_default(Literal::int(999))
+                                .into(),
+                        ])),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let projected_field_ids = [1, 2]; // id, test_struct
+
+        let mut transformer =
+            RecordBatchTransformerBuilder::new(snapshot_schema, &projected_field_ids).build();
+
+        // Parquet file has struct with only field a (missing c which has initial_default)
+        let struct_fields = vec![simple_field("a", DataType::Int32, true, "101")];
+        let struct_data_type = DataType::Struct(struct_fields.clone().into());
+
+        let parquet_schema = Arc::new(ArrowSchema::new(vec![
+            simple_field("id", DataType::Int32, false, "1"),
+            Field::new("test_struct", struct_data_type.clone(), true).with_metadata(
+                HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "2".to_string())]),
+            ),
+        ]));
+
+        let struct_array = StructArray::new(
+            struct_fields.into(),
+            vec![Arc::new(Int32Array::from(vec![Some(10), Some(20)]))],
+            None,
+        );
+
+        let parquet_batch = RecordBatch::try_new(parquet_schema, vec![
+            Arc::new(Int32Array::from(vec![1, 2])),
+            Arc::new(struct_array),
+        ])
+        .unwrap();
+
+        let result = transformer.process_record_batch(parquet_batch).unwrap();
+
+        let struct_column = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert_eq!(struct_column.num_columns(), 2);
+
+        // Field a: should have values from Parquet
+        let a_column = struct_column
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(a_column.value(0), 10);
+        assert_eq!(a_column.value(1), 20);
+
+        // Field c: should use initial_default value (999) per Iceberg spec rule #3
+        let c_column = struct_column
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(c_column.value(0), 999);
+        assert_eq!(c_column.value(1), 999);
     }
 }
