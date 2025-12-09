@@ -20,6 +20,8 @@
 mod schema;
 pub use schema::*;
 
+mod name_mapping;
+
 mod nan_val_cnt_visitor;
 pub(crate) use nan_val_cnt_visitor::*;
 pub(crate) mod caching_delete_file_loader;
