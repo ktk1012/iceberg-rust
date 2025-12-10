@@ -255,16 +255,33 @@ impl ArrowReader {
             initial_stream_builder
         };
 
-        // Create projection mask based on field IDs
-        // - If file has embedded IDs: field-ID-based projection (missing_field_ids=false)
-        // - If name mapping applied: field-ID-based projection (missing_field_ids=true but IDs now match)
-        // - If fallback IDs: position-based projection (missing_field_ids=true)
+        // Determine whether to use field-ID-based or position-based (fallback) projection.
+        //
+        // - Branch 1 (embedded IDs): missing_field_ids was false → use field-ID-based
+        // - Branch 2 (name mapping): schema now has correct field IDs → use field-ID-based
+        // - Branch 3 (fallback IDs): position-based IDs assigned → use fallback projection
+        //
+        // Only re-check when name mapping was applied, because name mapping assigns
+        // correct Iceberg field IDs that enable field-ID-based projection.
+        // Fallback IDs are position-based and still require fallback projection logic.
+        let missing_field_ids = if missing_field_ids && task.name_mapping.is_some() {
+            // Name mapping was applied - re-check if schema now has field IDs
+            record_batch_stream_builder
+                .schema()
+                .fields()
+                .iter()
+                .next()
+                .is_some_and(|f| f.metadata().get(PARQUET_FIELD_ID_META_KEY).is_none())
+        } else {
+            missing_field_ids
+        };
+
         let projection_mask = Self::get_arrow_projection_mask(
             &task.project_field_ids,
             &task.schema,
             record_batch_stream_builder.parquet_schema(),
             record_batch_stream_builder.schema(),
-            missing_field_ids, // Whether to use position-based (true) or field-ID-based (false) projection
+            missing_field_ids,
         )?;
 
         record_batch_stream_builder =
